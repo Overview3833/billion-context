@@ -989,6 +989,49 @@ export class UnifiedShadow {
         return this.sync.snapEgressView(sessionId);
     }
 
+    // #5874 2×2 stage 0 (brief 19544722): the element world-match accessors.
+    // Errors propagate (the lane maps the R3 reject to a hard 400 and every
+    // other fault to the legacy full path) — unlike snapEgressView these may
+    // NOT swallow.
+
+    /** Stage 0 for one turn (see UnifiedStore.snapStage0). null when there
+     *  is no sync store. */
+    snapStage0(sessionId: string, incoming: string[], opts?: { resync?: boolean, seqs?: number[] | null }): import("../snapshot/plane.js").Stage0Result | null {
+        if (this.sync === null) return null;
+        return this.sync.snapStage0(sessionId, incoming, opts);
+    }
+
+    /** The plane's ACTIVE cores, pos-ordered (old cores from the table). */
+    snapStage0Cores(sessionId: string): { rows: { pos: number; ids: string[]; postJson: string }[]; coverMax: Record<string, number> } | null {
+        if (this.sync === null) return null;
+        return this.sync.snapStage0Cores(sessionId);
+    }
+
+    /** #6181 round 2, Residual 2 hardening: the plane's max ACTIVE pos
+     *  (-1 when empty) — see UnifiedStore.snapPlaneMaxPos. */
+    snapPlaneMaxPos(sessionId: string): number {
+        if (this.sync === null) return -1;
+        return this.sync.snapPlaneMaxPos(sessionId);
+    }
+
+    /** The stage-0 resync (R4 / table-behind): reset the session plane. */
+    snapStage0Reset(sessionId: string): void {
+        if (this.sync === null) return;
+        this.sync.snapStage0Reset(sessionId);
+    }
+
+    /** #6181 M3: persisted R3 breaker latch (see UnifiedStore.snapR3Latched). */
+    snapR3Latched(sessionId: string): boolean {
+        if (this.sync === null) return false;
+        return this.sync.snapR3Latched(sessionId);
+    }
+
+    /** #6181 M3: persist the R3 breaker latch (best-effort). */
+    snapR3Latch(sessionId: string): void {
+        if (this.sync === null) return;
+        this.sync.snapR3Latch(sessionId);
+    }
+
     vacuum(mode: "full" | "incremental"): void {
         if (this.sync === null) throw new Error("[storage] sync vacuum unavailable on a network backend");
         return this.sync.vacuum(mode);

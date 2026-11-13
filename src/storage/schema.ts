@@ -366,7 +366,10 @@ CREATE TABLE IF NOT EXISTS l1_world (
     ledger_id      TEXT NOT NULL,
     witness_probe  TEXT NOT NULL,
     issued_at      INTEGER NOT NULL,
-    armed_at       INTEGER
+    armed_at       INTEGER,
+    envelope_json  TEXT,
+    envelope_checksum TEXT,
+    r3_latched_at  INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_l1_ledger ON l1_world(ledger_id);
 CREATE TABLE IF NOT EXISTS snap_rows (
@@ -421,6 +424,23 @@ export function migrateSchema(db: {
         .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'snap_rows'")
         .get();
     if (!hasSnapRows) db.transaction(() => db.exec(SNAPBASE_DDL_V12));
+    // 2×2 (#5874 brief, element-level world): the L1 world carries the
+    // per-element msgid ENVELOPE ({id, pos} canon, §4.0) in addition to the
+    // session-level witness_probe. Pure additive probe-first ALTER (a dev
+    // window that created l1_world before this column exists upgrades with
+    // one ALTER; a fresh DB already has it from the DDL above). The 2×2
+    // stage-0 (src/snapshot/identity.ts matchWorld) reads/writes these; the
+    // session-level v1 path (#5901) leaves them NULL and is unaffected.
+    const l1Cols = (db.prepare("PRAGMA table_info(l1_world)").all() as unknown as { name?: unknown }[])
+        .map((c) => c.name);
+    if (l1Cols.length > 0) {
+        if (!l1Cols.includes("envelope_json")) db.exec("ALTER TABLE l1_world ADD COLUMN envelope_json TEXT");
+        if (!l1Cols.includes("envelope_checksum")) db.exec("ALTER TABLE l1_world ADD COLUMN envelope_checksum TEXT");
+        // #6181 M3: the R3 breaker latch PERSISTS (a proxy restart must not
+        // re-arm a misbehaving host's sid and re-400 the same broken
+        // envelope); NULL/0 = not latched, else the epoch-ms of the latch.
+        if (!l1Cols.includes("r3_latched_at")) db.exec("ALTER TABLE l1_world ADD COLUMN r3_latched_at INTEGER");
+    }
     if (from >= STORAGE_SCHEMA_VERSION) return { from, to: from };
     let needV8Backfill = false;
     db.transaction(() => {

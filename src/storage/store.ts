@@ -25,16 +25,23 @@ import { migrateSchema, storagePragmas, WAL_JOURNAL_SIZE_LIMIT } from "./schema.
 import { identityOfStoredContent, splitMediaContent } from "./identity.js";
 import {
     applySnapInTransaction,
+    clearSnapPlaneDead,
     isSnapPlaneDead,
     markSnapPlaneDead,
     readSnapView,
     snapGcCoveredRows,
+    snapL1EnvelopeRead,
     snapL1Record,
+    snapR3LatchedRead,
+    snapR3LatchWrite,
     snapplaneStatusWire,
+    snapRowsAll,
     SnapPlaneDeadError,
     type SnapEvent,
     type SnapView,
 } from "./snap.js";
+import { parseEnvelope } from "../snapshot/identity.js";
+import { FoundationRejectError, stage0Decide, type Stage0Result } from "../snapshot/plane.js";
 import { recordIntegrityOutcome, recordSecondProcessOwner, recordBackupOutcome } from "./runtime-status.js";
 import { integrityModeFor, writeIntegrityCache, scheduleBackgroundIntegrityCheck, backgroundIntegrityInflightForTests, noteIntegrityCheckRun } from "./integrity-check.js";
 import { sqliteCorruptionDetail } from "./sqlite-errors.js";
@@ -371,6 +378,12 @@ export interface IngestSessionInput {
      *  from this view; null falls back to the defensive full-transcript diff
      *  (saves that don't carry a turn view). */
     planeMessages?: CoreMessage[] | null;
+    /** #6181 B0: one-shot plane-write skip for THIS save — set by the lane
+     *  for a turn that cannot be addressed against the plane (a non-cohort
+     *  chained delta). snapShadowSync returns before any plane work; the
+     *  flag is consumed at the persist build (the live session flag is
+     *  cleared by the lane after the in-request flush). */
+    skipPlaneFlush?: boolean;
     /** Serialized orphan map (Record<blockId, {one, full}>) — blockContents
      *  entries whose block is absent from state.blocks (#4216/#4242: the reap
      *  shape is REPRESENTABLE; rides the same transaction so the session row,
@@ -1537,6 +1550,13 @@ export class UnifiedStore {
         const sid = input.session.sessionId;
         if (this.hasLaneExt(sid)) return; // skip:lane — lane transcripts are not the cohort truth
         if (isSnapPlaneDead(sid)) return; // dead (R1) — sticky, silent; status surfaces it
+        // #6181 B0: a turn that CANNOT be addressed against the plane (a
+        // non-cohort chained delta — its kernel view is a delta, not the
+        // world) skips the plane write for THIS save: deriving events from
+        // the collapsed view would DELETE every row the view does not
+        // contain (snapViewEvents is a final-state diff). The flag is
+        // one-shot — consumed by the persist build, not here.
+        if (input.skipPlaneFlush) return;
         const now = Date.now();
         // Stage-0 identity: raw host session id → ledger id (v1 mapping: the
         // conversation binding, session_id when there is none).
@@ -1552,6 +1572,38 @@ export class UnifiedStore {
         // plane's tagged forms).
         const view = input.planeMessages;
         const tagged = Array.isArray(view) && view.length > 0;
+        // #6181 B4 (stack on the #5901 head with #6326 durability-before-render):
+        // an UNTAGGED save against a sid that already holds active plane rows
+        // can only update the plane when its ledger-id view EXTENDS the
+        // stage-0 world: stage0Decide writes the l1 envelope and declares the
+        // new positions, but the ROWS for those positions land at the NEXT
+        // save — and for a pinned cohort that next save is often an untagged
+        // one (#6326's ingestRowsNow persists before render). So:
+        //   • view ids ⊇ envelope ids (prefix-identical) → ALLOW: the legacy
+        //     diff materializes the declared rows (ids agree, idempotent);
+        //   • anything else is STALE w.r.t. the pinned world — re-derived
+        //     kernel ids (h_…), a pre-turn transcript, a compaction — and the
+        //     legacy diff could only delete/re-home the pinned rows (the R2
+        //     doctrine: the tagged plane is addressable from tagged views
+        //     only) → SKIP the plane; the disk record still lands (the
+        //     #6326 durability win survives) and the plane is updated by the
+        //     next TAGGED save or a stage-0 resync (one-round convergence).
+        // MUST run before the transaction — after it the destructive legacy
+        // diff is already committed.
+        if (!tagged && (input.planeMessages ?? []).length === 0) {
+            const anyRow = (snapRowsAll(this.db, sid) ?? []).some((r) => r.active === 1);
+            if (anyRow) {
+                const env = snapL1EnvelopeRead(this.db, sessRaw);
+                const envIds =
+                    env && env.envelopeJson !== null
+                        ? parseEnvelope(env.envelopeJson).envelope.map((e) => e.id)
+                        : [];
+                const viewIds = input.messages.map((m) => m.msgId);
+                const extendsEnvelope =
+                    viewIds.length >= envIds.length && envIds.every((id, i) => viewIds[i] === id);
+                if (!extendsEnvelope) return;
+            }
+        }
         try {
             const out = this.db.transaction(() => {
                 const l1 = snapL1Record(this.db, sessRaw, sid, witness, now);
@@ -2428,6 +2480,113 @@ export class UnifiedStore {
             }
             throw err;
         }
+    }
+
+    // #5874 2×2 stage 0 (brief 19544722): the element world match lives at the
+    // head of the chain, BEFORE protocol conversion. These accessors are the
+    // storage side of that stage — the pure decision (snapshot/plane.ts) and
+    // the kernel-input assembly (snapshot/assemble.ts) are lane-side.
+
+    private snapSessRawOf(sid: string): string {
+        // Raw host session id (P9: never truncated) → the l1_world key; the
+        // conversation binding when the host supplied one, the sid otherwise.
+        // (Same resolution as the save path below — stage 0 and the plane
+        // commit must address the SAME l1 row.)
+        return (
+            (this.db.prepare("SELECT conversation_id FROM conversations WHERE session_id = ?").get(sid) as { conversation_id: string } | undefined)
+                ?.conversation_id ?? sid
+        );
+    }
+
+    /** Stage 0 for one turn: ensure the l1 row exists (idempotent session-
+     *  level v1 record), run the element world match on the stored envelope,
+     *  and persist the new canon (every verdict except `diverge` — that one
+     *  has zero side effects by construction). A session-level identity
+     *  conflict ("red") throws — the lane maps it to the R3 hard 400 BEFORE
+     *  any kernel side effect.
+     */
+    snapStage0(sid: string, incoming: string[], opts?: { resync?: boolean, seqs?: number[] | null }): Stage0Result {
+        const sessRaw = this.snapSessRawOf(sid);
+        const now = Date.now();
+        const l1 = snapL1Record(this.db, sessRaw, sid, this.snapWitnessProbe(sid), now);
+        if (l1 === "red") {
+            // Session-level identity conflict (R3): the raw host id maps to a
+            // DIFFERENT ledger. Hard-reject BEFORE any kernel side effect —
+            // snapL1Record wrote nothing on this path.
+            throw new FoundationRejectError(`l1 ledger conflict: sess_raw=${sessRaw} maps to another ledger (R3)`);
+        }
+        return stage0Decide({ db: this.db, sessRaw, ledgerId: sid, incoming, seqs: opts?.seqs ?? null, resync: opts?.resync, now });
+    }
+
+    /** The plane's ACTIVE rows, pos-ordered — the "old cores from the table"
+     *  half of the kernel-input assembly. post_json is the tagged kernel
+     *  byte (invariant v) in its STORED (media-offloaded) form; the caller
+     *  hydrates before feeding the kernel. `coverMax` maps each active
+     *  block id to the HIGHEST row pos it covers (over the FULL row set —
+     *  the covered rows themselves) — the kernel-input anchor placement
+     *  input (an anchor renders before the first surviving element above
+     *  its covered run). */
+    snapStage0Cores(sid: string): { rows: { pos: number; ids: string[]; postJson: string }[]; coverMax: Record<string, number> } {
+        const all = snapRowsAll(this.db, sid);
+        const coverMax: Record<string, number> = {};
+        for (const r of all) {
+            if (r.coverRef !== null && r.pos > (coverMax[r.coverRef] ?? -1)) {
+                coverMax[r.coverRef] = r.pos;
+            }
+        }
+        const rows = all
+            .filter((r) => r.active === 1 && r.postJson !== null)
+            .map((r) => ({ pos: r.pos, ids: r.coreIds, postJson: this.hydrateMedia(r.postJson as string) }));
+        return { rows, coverMax };
+    }
+
+    /** #6181 round 2, Residual 2 hardening: the plane's max ACTIVE pos for
+     *  this sid (-1 when the plane has no active row) — the frontier a
+     *  full-world round leaves the provider chain holding. */
+    snapPlaneMaxPos(sid: string): number {
+        const all = snapRowsAll(this.db, sid);
+        let max = -1;
+        for (const r of all) {
+            if (r.active === 1 && r.pos > max) max = r.pos;
+        }
+        return max;
+    }
+
+    /** The stage-0 resync (brief red gate R4 / the resync ruling): reset the
+     *  session's plane (rows + log + ckpt + the l1 element envelope + the
+     *  sticky R1 latch) in one txn. This turn then runs the legacy full path
+     *  and re-seeds the plane through the normal in-request flush; the NEXT
+     *  turn re-issues the envelope from the client's current array (one-round
+     *  convergence). */
+    snapStage0Reset(sid: string): void {
+        const sessRaw = this.snapSessRawOf(sid);
+        this.db.transaction(() => {
+            this.db.prepare("DELETE FROM snap_rows WHERE sid = ?").run(sid);
+            this.db.prepare("DELETE FROM snap_log WHERE sid = ?").run(sid);
+            this.db.prepare("DELETE FROM snap_ckpt WHERE sid = ?").run(sid);
+            this.db.prepare("UPDATE l1_world SET envelope_json = NULL, envelope_checksum = NULL WHERE sess_raw = ?").run(sessRaw);
+        });
+        clearSnapPlaneDead(sid);
+    }
+
+    /** #6181 M3: whether this sid's R3 breaker latch PERSISTED from a
+     *  previous process (a restart must not re-arm a misbehaving host and
+     *  re-400 the same broken envelope). */
+    snapR3Latched(sid: string): boolean {
+        try {
+            return snapR3LatchedRead(this.db, this.snapSessRawOf(sid));
+        } catch {
+            return false; // schema/column edge: treat as unlatched, the in-memory breaker still fires
+        }
+    }
+
+    /** #6181 M3: persist the R3 breaker latch (best-effort — a failed
+     *  write degrades to the in-memory latch, which still fires this
+     *  process). */
+    snapR3Latch(sid: string): void {
+        try {
+            snapR3LatchWrite(this.db, this.snapSessRawOf(sid), Date.now());
+        } catch { /* best-effort — see above */ }
     }
 
     /** #3250: cadence-tick WAL reclamation (see WAL_CHECKPOINT_EVERY_INGESTS).

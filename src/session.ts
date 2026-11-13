@@ -694,6 +694,42 @@ export type Session = {
      *  only the light transform (absorb/attach/strip/drop) — no seam walk,
      *  no re-tagging, no id re-keying. Cleared per turn like lastMessages. */
     lastPlaneMessages?: CoreMessage[];
+    /** #6181 B0: one-shot "skip the snapshot-plane write on the next
+     *  save" — set by the lane for a turn that CANNOT be addressed against
+     *  the plane (a non-cohort chained delta whose kernel view is a delta,
+     *  not the world): deriving events from it would delete every row the
+     *  view does not contain. snapShadowSync clears it when it consumes it
+     *  (one save, then the flag is gone). */
+    skipPlaneFlush?: boolean;
+    /** 2×2 Part B (出站增量, responses lane only): the incremental-outbound
+     *  frontier — the highest plane row pos + anchor summary ids the provider
+     *  already has via its retained chain. Persisted with the session; lost
+     *  state → next round reseeds (full send), one-round convergence. See
+     *  src/snapshot/delta.ts. */
+    responsesDelta?: { frontierPos: number; servedAnchors: string[] } | null;
+    /** #6181 review round 2, Residual 2 companion: the provider's chain may
+     *  NOT be assumed to hold the stored world. Set when a delta-selection
+     *  round was REFUSED upstream (the provider never ran it — its chain
+     *  holds at most the previously-accepted world while the plane already
+     *  holds more). While set, the first-chained-round frontier seed is
+     *  blocked and the round re-seeds the FULL view (at-least-once —
+     *  over-serving is safe, under-serving is the context loss). Cleared
+     *  when a full-view round is accepted (the provider provably holds the
+     *  whole world again). Transient within a turn? No — persisted with the
+     *  session, like responsesDelta. */
+    responsesChainBroken?: boolean;
+    /** #6181 round 2, Residual 2 hardening: the latest response id THIS
+     *  proxy emitted for this session (responses lane), paired with the
+     *  plane frontier the provider chain provably held after that response
+     *  (committed only on an ACCEPTED forward — a refused round mints
+     *  nothing the client chains from). The chain id itself is opaque:
+     *  the first-chained-round frontier seed AND every persisted frontier
+     *  are trusted only when previous_response_id equals this id (the host
+     *  continues from our latest response — a fork/rewind to an older id,
+     *  or an id another proxy minted, can carry a world that chain never
+     *  held, so it re-seeds instead). Persisted with the session, like
+     *  responsesDelta. */
+    lastMintedResponse?: { id: string; frontierPos: number } | null;
     pluginSnapshot?: CoreMessage[];
     /** #3301: original message decompositions supplied by an external state
      *  converter (e.g. opencode-acp migration) at import time. Transient

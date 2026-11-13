@@ -2442,6 +2442,51 @@ export class SessionStore {
         }
     }
 
+    // #5874 2×2 stage 0 (brief 19544722): errors PROPAGATE (the lane maps the
+    // R3 reject to a hard 400 and any other fault to the legacy full path) —
+    // the egress-view swallow above must not be copied here.
+
+    /** Stage 0 (element world match) for one turn. null when the unified
+     *  store is unavailable — the lane keeps the legacy path. */
+    snapStage0(sessionId: string, incoming: string[], opts?: { resync?: boolean, seqs?: number[] | null }): import("./snapshot/plane.js").Stage0Result | null {
+        if (!this.replicasAvailable()) return null;
+        return this.liveShadow().snapStage0(sessionId, incoming, opts);
+    }
+
+    /** The plane's ACTIVE cores, pos-ordered (the "old cores from the
+     *  table" half of the kernel-input assembly). */
+    snapStage0Cores(sessionId: string): { rows: { pos: number; ids: string[]; postJson: string }[]; coverMax: Record<string, number> } | null {
+        if (!this.replicasAvailable()) return null;
+        return this.liveShadow().snapStage0Cores(sessionId);
+    }
+
+    /** #6181 round 2, Residual 2 hardening: the plane's max ACTIVE pos
+     *  (-1 when empty) — see UnifiedStore.snapPlaneMaxPos. */
+    snapPlaneMaxPos(sessionId: string): number {
+        if (!this.replicasAvailable()) return -1;
+        return this.liveShadow().snapPlaneMaxPos(sessionId);
+    }
+
+    /** The stage-0 resync (R4 / table behind): reset the session plane so
+     *  the next turn re-issues from the client's current array. */
+    snapStage0Reset(sessionId: string): void {
+        if (!this.replicasAvailable()) return;
+        this.liveShadow().snapStage0Reset(sessionId);
+    }
+
+    /** #6181 M3: whether this sid's R3 breaker latch persisted from a
+     *  previous process (a restart must not re-arm a misbehaving host). */
+    snapR3Latched(sessionId: string): boolean {
+        if (!this.replicasAvailable()) return false;
+        return this.liveShadow().snapR3Latched(sessionId);
+    }
+
+    /** #6181 M3: persist the R3 breaker latch (best-effort). */
+    snapR3Latch(sessionId: string): void {
+        if (!this.replicasAvailable()) return;
+        this.liveShadow().snapR3Latch(sessionId);
+    }
+
     /** #3928: physical index.db shrink after deletions (`bili sessions rm`).
      *  Throws on failure — the deletion itself is already committed, callers
      *  report the shrink as partial. Throws in legacy-only lanes — check
