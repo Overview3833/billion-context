@@ -17,6 +17,15 @@ const cfgPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "notice-reg-cfg-
 process.env.DSH_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "notice-reg-dsh-"));
 process.env.XDG_STATE_HOME = stateDir;
 process.env.BILI_CONFIG_FILE = cfgPath;
+// #6480: the CI test baseline pins BILI_STORAGE_UNIFIED=legacy
+// (tests/preload-storage-baseline.mjs, #4011). An explicit selection is a
+// user decision that legitimately hides the fresh-install default-flip
+// notice, and these assertions target the absent-selection posture — lift
+// the pin for this file (same hermetic rationale as the XDG/config
+// isolation above). Master merged #6480 without a main-CI run (push event
+// dropped), so this regression only surfaced on the first PR CI to carry
+// both the notice tests and the legacy baseline.
+delete process.env.BILI_STORAGE_UNIFIED;
 
 const { NOTICES, visibleNotices, SQLITE_DEFAULT_NOTICE_ID } = await import("../src/notices.ts");
 const { IOT_INCOMPAT_NOTICE_ID, PCK_NOTICE_ID, WM_FASTPATH_INTRO_ID, dismissUpgradeNotice } = await import("../src/pck-notice.ts");
